@@ -27,19 +27,30 @@ function textOnly(label: string): { content: [{ type: "text"; text: string }] } 
   return { content: [{ type: "text", text: label }] };
 }
 
-const Coordinate = Type.Tuple([Type.Number(), Type.Number()], {
+// Use a fixed-length Array schema (single `items` schema + minItems/maxItems)
+// instead of Type.Tuple. Tuple emits the legacy `items: [<schema>, <schema>]`
+// array form, which OpenAI/OpenRouter's tool-call validator rejects with
+// "[{'type': 'number'}, ...] is not of type 'object', 'boolean'". This shape
+// matches the MCP server (`z.array(z.number()).length(2)`).
+const Coordinate = Type.Array(Type.Number(), {
+  minItems: 2,
+  maxItems: 2,
   description: "(x, y) coordinates normalized to [0, 1000].",
 });
 
-const Button = Type.Union(
-  [Type.Literal("left"), Type.Literal("right"), Type.Literal("middle")],
-  { default: "left", description: "Mouse button." },
-);
+// Flat enum schemas instead of Type.Union — OpenAI/OpenRouter and Vertex
+// reject anyOf at this position. Mirrors zod's z.enum(...) output.
+const Button = Type.String({
+  enum: ["left", "right", "middle"],
+  default: "left",
+  description: "Mouse button.",
+});
 
-const Clicks = Type.Union(
-  [Type.Literal(1), Type.Literal(2), Type.Literal(3)],
-  { default: 1, description: "Number of clicks: 1=single, 2=double, 3=triple." },
-);
+const Clicks = Type.Number({
+  enum: [1, 2, 3],
+  default: 1,
+  description: "Number of clicks: 1=single, 2=double, 3=triple.",
+});
 
 export function createCuaTools(client: CuaClient): AgentTool[] {
   return [
@@ -239,10 +250,10 @@ export function createCuaTools(client: CuaClient): AgentTool[] {
       description: "On a desktop, scroll in a specified direction by a specified amount.",
       label: "Scroll",
       parameters: Type.Object({
-        direction: Type.Union(
-          [Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right")],
-          { description: "The direction to scroll." },
-        ),
+        direction: Type.String({
+          enum: ["up", "down", "left", "right"],
+          description: "The direction to scroll.",
+        }),
         amount: Type.Number({ description: "Number of scroll units." }),
         coordinate: Type.Optional(Coordinate),
       }),
