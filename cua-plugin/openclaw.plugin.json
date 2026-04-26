@@ -1,0 +1,16 @@
+{
+  "id": "cua",
+  "name": "CUA Computer Use",
+  "description": "LiteDesktopActionSpace desktop control via local CUA computer-server. Provides screenshot, click, type, scroll, key, drag, and related tools using normalized [0, 1000] coordinates.",
+  "enabledByDefault": false,
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serverUrl": {
+        "type": "string",
+        "description": "CUA computer-server URL (default: http://localhost:5000)"
+      }
+    }
+  }
+}
