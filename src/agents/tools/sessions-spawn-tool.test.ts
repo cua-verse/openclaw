@@ -549,6 +549,25 @@ describe("sessions_spawn tool", () => {
     expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
   });
 
+  it('treats model="default" as no explicit model override', async () => {
+    const tool = createSessionsSpawnTool({
+      agentSessionKey: "agent:main:main",
+    });
+
+    await tool.execute("call-model-default", {
+      task: "analyze file",
+      model: "default",
+    });
+
+    expect(hoisted.spawnSubagentDirectMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        task: "analyze file",
+        model: undefined,
+      }),
+      expect.any(Object),
+    );
+  });
+
   it("keeps attachment content schema unconstrained for llama.cpp grammar safety", () => {
     const tool = createSessionsSpawnTool();
     const schema = tool.parameters as {
