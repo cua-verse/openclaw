@@ -11,7 +11,9 @@ export type DeviceBootstrapProfileInput = {
 };
 
 export const BOOTSTRAP_HANDOFF_OPERATOR_SCOPES = [
+  "operator.admin",
   "operator.approvals",
+  "operator.pairing",
   "operator.read",
   "operator.talk.secrets",
   "operator.write",
