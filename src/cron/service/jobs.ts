@@ -193,6 +193,142 @@ function assertMainSessionAgentId(
   }
 }
 
+// Treat an all-empty failureDestination object as if the field were
+// omitted entirely. Agent tool wrappers commonly pad cron.add payloads
+// with `failureDestination: {channel:"", to:"", accountId:"", mode:"announce"}`
+// even when the agent didn't ask for any failure routing. Without this
+// coercion, those empty strings either trip the schema's NonEmptyString
+// constraint or trip the "is only supported for sessionTarget=isolated"
+// business rule below — both rejections push agents into a parameter-
+// tweaking loop instead of recognizing they should just drop the field.
+//
+// `mode:"announce"` is treated as the default sentinel here: many wrappers
+// hard-code it as the default. Combined with empty channel/to/accountId,
+// it's semantically nothing.
+export function isEmptyFailureDestination(fd: unknown): boolean {
+  if (!fd || typeof fd !== "object") return true;
+  const o = fd as Record<string, unknown>;
+  const channelEmpty = o.channel === undefined || o.channel === "";
+  const toEmpty = o.to === undefined || o.to === "";
+  const accountIdEmpty = o.accountId === undefined || o.accountId === "";
+  const modeNoop = o.mode === undefined || o.mode === "" || o.mode === "announce";
+  return channelEmpty && toEmpty && accountIdEmpty && modeNoop;
+}
+
+// Same idea for the outer delivery block. A delivery object with no
+// `mode` (undefined or "") and no real channel/to/etc. is normalized to
+// `delivery: undefined`. NOTE: `mode:"none"` is NOT empty here — the
+// agent explicitly opted out of delivery, which overrides the default
+// `announce` for isolated agentTurn jobs. Collapsing `{mode:"none"}` to
+// undefined would silently re-enable announce.
+export function isEffectivelyEmptyDelivery(d: unknown): boolean {
+  if (!d || typeof d !== "object") return true;
+  const o = d as Record<string, unknown>;
+  const modeEmpty = o.mode === undefined || o.mode === "";
+  const channelEmpty = o.channel === undefined || o.channel === "";
+  const toEmpty = o.to === undefined || o.to === "";
+  const accountIdEmpty = o.accountId === undefined || o.accountId === "";
+  const bestEffortEmpty = o.bestEffort === undefined || o.bestEffort === false;
+  const fdEmpty = isEmptyFailureDestination(o.failureDestination);
+  return modeEmpty && channelEmpty && toEmpty && accountIdEmpty && bestEffortEmpty && fdEmpty;
+}
+
+// Treat an all-empty failureAlert object as if the field were omitted.
+// Same wrapper-tolerance reasoning as isEmptyFailureDestination above:
+// agent tool shims commonly pad cron.add payloads with
+// `failureAlert: {after:0, channel:"", to:"", cooldownMs:0, mode:"announce",
+// accountId:""}` even when the agent didn't ask for any failure-alert
+// behavior. Without this coercion the schema rejects the empty strings
+// (NonEmptyString on channel/accountId) or the alert sticks around as a
+// no-op record.
+//
+// `failureAlert: false` is NOT empty here — it's an explicit opt-out
+// distinct from "field omitted".
+export function isEmptyFailureAlert(fa: unknown): boolean {
+  if (fa === false) return false;
+  if (!fa || typeof fa !== "object") return true;
+  const o = fa as Record<string, unknown>;
+  const afterEmpty = o.after === undefined || (typeof o.after === "number" && o.after <= 0);
+  const channelEmpty = o.channel === undefined || o.channel === "";
+  const toEmpty = o.to === undefined || o.to === "";
+  const cooldownEmpty =
+    o.cooldownMs === undefined || (typeof o.cooldownMs === "number" && o.cooldownMs <= 0);
+  const modeNoop = o.mode === undefined || o.mode === "" || o.mode === "announce";
+  const accountIdEmpty = o.accountId === undefined || o.accountId === "";
+  return afterEmpty && channelEmpty && toEmpty && cooldownEmpty && modeNoop && accountIdEmpty;
+}
+
+// Strip wrapper-emitted empty-string fields inside `failureAlert` and
+// collapse an all-empty failureAlert to undefined. Mirrors
+// normalizeEmptyDeliveryShape but operates on the top-level
+// `job.failureAlert` field (failureAlert is not nested under delivery).
+//
+// `failureAlert === false` is preserved as-is — that's an explicit opt-out
+// from the global default and must not be collapsed to undefined.
+function normalizeEmptyFailureAlertShape(
+  job: Pick<CronJob, "failureAlert"> & { failureAlert?: CronJob["failureAlert"] },
+): void {
+  const fa = job.failureAlert;
+  if (fa === undefined || fa === false) return;
+  if (typeof fa !== "object") return;
+
+  // Outer collapse first: if the whole alert object is wrapper-junk
+  // (all-empty by isEmptyFailureAlert's noop heuristics), drop it.
+  if (isEmptyFailureAlert(fa)) {
+    job.failureAlert = undefined;
+    return;
+  }
+
+  // Otherwise, strip just the empty-string fields the schema now
+  // tolerates so downstream code (delivery resolver, alert dispatcher)
+  // doesn't have to pattern-match on "" vs undefined. Leave a meaningful
+  // `mode: "announce"` intact when other fields are populated, mirroring
+  // normalizeEmptyDeliveryShape.
+  const o = fa as Record<string, unknown>;
+  if (o.channel === "") delete o.channel;
+  if (o.to === "") delete o.to;
+  if (o.accountId === "") delete o.accountId;
+  if (o.mode === "") delete o.mode;
+}
+
+// Strip semantically-empty `failureDestination` and `delivery` from a
+// CronJob in-place so the rest of the codebase (storage, scheduler,
+// delivery resolver, asserts) doesn't have to pattern-match on junk.
+//
+// Two-phase cleanup:
+//   1. Inner: strip wrapper-emitted empty-string fields inside `delivery`
+//      (channel:"", to:"", accountId:"") and an all-empty
+//      `failureDestination`. This leaves a meaningful `mode:"none"`
+//      intact for agents that explicitly opted out of delivery.
+//   2. Outer: if everything in `delivery` is now absent (no mode, no
+//      channel, no real failureDestination), collapse to `undefined`.
+function normalizeEmptyDeliveryShape(
+  job: Pick<CronJob, "delivery"> & { delivery?: CronJob["delivery"] },
+): void {
+  const delivery = job.delivery as Record<string, unknown> | undefined;
+  if (!delivery) return;
+
+  // Inner cleanup: drop empty-string fields that the schema already
+  // accepts but downstream code interprets as junk.
+  if (delivery.channel === "") delete delivery.channel;
+  if (delivery.to === "") delete delivery.to;
+  if (delivery.accountId === "") delete delivery.accountId;
+  if (delivery.failureDestination && isEmptyFailureDestination(delivery.failureDestination)) {
+    delete delivery.failureDestination;
+  } else if (delivery.failureDestination && typeof delivery.failureDestination === "object") {
+    const fd = delivery.failureDestination as Record<string, unknown>;
+    if (fd.channel === "") delete fd.channel;
+    if (fd.to === "") delete fd.to;
+    if (fd.accountId === "") delete fd.accountId;
+  }
+
+  // Outer collapse: if nothing meaningful is left, drop the delivery
+  // object entirely.
+  if (isEffectivelyEmptyDelivery(delivery)) {
+    job.delivery = undefined;
+  }
+}
+
 function assertDeliverySupport(job: Pick<CronJob, "sessionTarget" | "delivery">) {
   // No delivery object or mode is "none" -- nothing to validate.
   if (!job.delivery || job.delivery.mode === "none") {
@@ -212,18 +348,25 @@ function assertDeliverySupport(job: Pick<CronJob, "sessionTarget" | "delivery">)
     job.sessionTarget === "current" ||
     job.sessionTarget.startsWith("session:");
   if (!isIsolatedLike) {
-    throw new Error('cron channel delivery config is only supported for sessionTarget="isolated"');
+    throw new Error(
+      "cron channel delivery config is not allowed on main-session jobs. " +
+        'Either omit delivery (or set delivery.mode="none"), or use ' +
+        'sessionTarget="isolated", or set delivery.mode="webhook".',
+    );
   }
 }
 
 function assertFailureDestinationSupport(job: Pick<CronJob, "sessionTarget" | "delivery">) {
   const failureDestination = job.delivery?.failureDestination;
-  if (!failureDestination) {
+  if (!failureDestination || isEmptyFailureDestination(failureDestination)) {
     return;
   }
   if (job.sessionTarget === "main" && job.delivery?.mode !== "webhook") {
     throw new Error(
-      'cron delivery.failureDestination is only supported for sessionTarget="isolated" unless delivery.mode="webhook"',
+      "cron delivery.failureDestination is not allowed on main-session jobs. " +
+        "Either omit delivery.failureDestination (failures still log to disk and " +
+        'to cron.failureDestination if configured), or set sessionTarget="isolated", ' +
+        'or set delivery.mode="webhook".',
     );
   }
   if (failureDestination.mode === "webhook") {
@@ -604,6 +747,8 @@ export function createJob(state: CronServiceState, input: CronJobCreate): CronJo
       ...input.state,
     },
   };
+  normalizeEmptyDeliveryShape(job);
+  normalizeEmptyFailureAlertShape(job);
   assertSupportedJobSpec(job);
   assertMainSessionAgentId(job, state.deps.defaultAgentId);
   assertDeliverySupport(job);
@@ -662,13 +807,19 @@ export function applyJobPatch(
   if ("failureAlert" in patch) {
     job.failureAlert = mergeCronFailureAlert(job.failureAlert, patch.failureAlert);
   }
+  normalizeEmptyDeliveryShape(job);
+  normalizeEmptyFailureAlertShape(job);
   if (
     job.sessionTarget === "main" &&
     job.delivery?.mode !== "webhook" &&
-    job.delivery?.failureDestination
+    job.delivery?.failureDestination &&
+    !isEmptyFailureDestination(job.delivery.failureDestination)
   ) {
     throw new Error(
-      'cron delivery.failureDestination is only supported for sessionTarget="isolated" unless delivery.mode="webhook"',
+      "cron delivery.failureDestination is not allowed on main-session jobs. " +
+        "Either omit delivery.failureDestination (failures still log to disk and " +
+        'to cron.failureDestination if configured), or set sessionTarget="isolated", ' +
+        'or set delivery.mode="webhook".',
     );
   }
   if (job.sessionTarget === "main" && job.delivery?.mode !== "webhook") {

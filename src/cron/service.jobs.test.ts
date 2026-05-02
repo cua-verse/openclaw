@@ -362,7 +362,7 @@ describe("applyJobPatch", () => {
     });
 
     expect(() => applyJobPatch(job, { enabled: true })).toThrow(
-      'cron delivery.failureDestination is only supported for sessionTarget="isolated" unless delivery.mode="webhook"',
+      /cron delivery\.failureDestination is not allowed on main-session jobs/,
     );
   });
 
@@ -432,6 +432,202 @@ function createMockState(now: number, opts?: { defaultAgentId?: string }): CronS
     },
   } as unknown as CronServiceState;
 }
+
+// Patch A regression coverage: agent tool wrappers commonly pad cron.add
+// payloads with empty-string defaults inside `delivery` and
+// `delivery.failureDestination` even when the agent didn't ask for any
+// delivery routing. Prior to this normalization, those empties either
+// tripped schema NonEmptyString or the "is only supported for sessionTarget"
+// business rule and dragged agents into a parameter-tweaking loop.
+describe("createJob tolerates wrapper-emitted empty delivery defaults", () => {
+  const now = Date.parse("2026-05-01T00:00:00.000Z");
+  const baseInput = (overrides: Record<string, unknown> = {}) => ({
+    name: "wrapper-tolerance-job",
+    enabled: true,
+    schedule: { kind: "at" as const, atMs: now + 60_000 },
+    sessionTarget: "main" as const,
+    wakeMode: "now" as const,
+    payload: { kind: "systemEvent" as const, text: "ping" },
+    ...overrides,
+  });
+
+  it("accepts main-session jobs whose failureDestination is all-empty strings", () => {
+    const state = createMockState(now);
+    const job = createJob(
+      state,
+      baseInput({
+        delivery: {
+          mode: "none",
+          channel: "",
+          to: "",
+          accountId: "",
+          bestEffort: false,
+          failureDestination: { channel: "", to: "", accountId: "", mode: "announce" },
+        },
+      }) as Parameters<typeof createJob>[1],
+    );
+    // mode:"none" is preserved (meaningful opt-out); empty fields and
+    // empty failureDestination are stripped.
+    expect(job.delivery).toEqual({ mode: "none", bestEffort: false });
+    expect(job.delivery?.failureDestination).toBeUndefined();
+  });
+
+  it("collapses a delivery block with no mode and all empty fields", () => {
+    const state = createMockState(now);
+    const job = createJob(
+      state,
+      baseInput({
+        delivery: { channel: "", to: "", accountId: "", bestEffort: false },
+      }) as Parameters<typeof createJob>[1],
+    );
+    // No real mode and nothing meaningful inside → delivery should be undefined.
+    expect(job.delivery).toBeUndefined();
+  });
+
+  it("strips empty failureDestination but preserves real announce delivery on isolated jobs", () => {
+    const state = createMockState(now);
+    const job = createJob(state, {
+      name: "iso-with-empty-fd",
+      enabled: true,
+      schedule: { kind: "at" as const, atMs: now + 60_000 },
+      sessionTarget: "isolated" as const,
+      wakeMode: "now" as const,
+      payload: { kind: "agentTurn" as const, message: "go" },
+      delivery: {
+        mode: "announce" as const,
+        channel: "telegram",
+        to: "123",
+        failureDestination: { channel: "", to: "", accountId: "", mode: "announce" },
+      },
+    });
+    expect(job.delivery?.mode).toBe("announce");
+    expect(job.delivery?.channel).toBe("telegram");
+    expect(job.delivery?.failureDestination).toBeUndefined();
+  });
+
+  it("still rejects main-session jobs with a meaningfully populated failureDestination", () => {
+    const state = createMockState(now);
+    expect(() =>
+      createJob(
+        state,
+        baseInput({
+          delivery: {
+            mode: "none",
+            failureDestination: { channel: "telegram", to: "999", mode: "announce" },
+          },
+        }) as Parameters<typeof createJob>[1],
+      ),
+    ).toThrow(/cron delivery\.failureDestination is not allowed on main-session jobs/);
+  });
+});
+
+// Patch C regression coverage: same wrapper-tolerance reasoning as the
+// delivery block above, but for the top-level `failureAlert` field.
+// Today's smoke (2026-05-01 cron-only run, gpt-5.4) showed the agent's
+// first three cron.add attempts rejected by NonEmptyString on
+// `failureAlert.channel: ""` even though the agent had no failure-alert
+// intent — only the 4th attempt (with failureAlert removed) succeeded.
+describe("createJob tolerates wrapper-emitted empty failureAlert defaults", () => {
+  const now = Date.parse("2026-05-01T00:00:00.000Z");
+  const baseInput = (overrides: Record<string, unknown> = {}) => ({
+    name: "wrapper-tolerance-fa-job",
+    enabled: true,
+    schedule: { kind: "at" as const, atMs: now + 60_000 },
+    sessionTarget: "main" as const,
+    wakeMode: "now" as const,
+    payload: { kind: "systemEvent" as const, text: "ping" },
+    ...overrides,
+  });
+
+  it("collapses an all-empty failureAlert to undefined", () => {
+    const state = createMockState(now);
+    const job = createJob(
+      state,
+      baseInput({
+        failureAlert: {
+          after: 0,
+          channel: "",
+          to: "",
+          cooldownMs: 0,
+          mode: "announce",
+          accountId: "",
+        },
+      }) as Parameters<typeof createJob>[1],
+    );
+    expect(job.failureAlert).toBeUndefined();
+  });
+
+  it("preserves a meaningful failureAlert and strips empty-string fields inside", () => {
+    const state = createMockState(now);
+    const job = createJob(
+      state,
+      baseInput({
+        sessionTarget: "isolated" as const,
+        payload: { kind: "agentTurn" as const, message: "go" },
+        failureAlert: {
+          after: 3,
+          channel: "",
+          to: "",
+          cooldownMs: 60_000,
+          mode: "announce",
+          accountId: "",
+        },
+      }) as Parameters<typeof createJob>[1],
+    );
+    expect(job.failureAlert).toBeDefined();
+    expect(job.failureAlert).not.toBe(false);
+    if (job.failureAlert && job.failureAlert !== false) {
+      expect(job.failureAlert.after).toBe(3);
+      expect(job.failureAlert.cooldownMs).toBe(60_000);
+      expect(job.failureAlert.channel).toBeUndefined();
+      expect(job.failureAlert.to).toBeUndefined();
+      expect(job.failureAlert.accountId).toBeUndefined();
+      // mode:"announce" is preserved when other fields are populated
+      // (mirrors normalizeEmptyDeliveryShape's mode handling).
+      expect(job.failureAlert.mode).toBe("announce");
+    }
+  });
+
+  it("preserves failureAlert: false as an explicit opt-out", () => {
+    const state = createMockState(now);
+    const job = createJob(
+      state,
+      baseInput({ failureAlert: false }) as Parameters<typeof createJob>[1],
+    );
+    expect(job.failureAlert).toBe(false);
+  });
+
+  it("collapses an empty failureAlert paired with empty delivery on a main-session job", () => {
+    // Exact wrapper-junk payload observed in the 2026-05-01 cron-only smoke:
+    // both delivery and failureAlert padded with empty defaults. Both should
+    // collapse without rejecting the job.
+    const state = createMockState(now);
+    const job = createJob(
+      state,
+      baseInput({
+        delivery: {
+          mode: "none",
+          channel: "",
+          to: "",
+          accountId: "",
+          bestEffort: false,
+          failureDestination: { channel: "", to: "", accountId: "", mode: "announce" },
+        },
+        failureAlert: {
+          after: 0,
+          channel: "",
+          to: "",
+          cooldownMs: 0,
+          mode: "announce",
+          accountId: "",
+        },
+      }) as Parameters<typeof createJob>[1],
+    );
+    expect(job.delivery).toEqual({ mode: "none", bestEffort: false });
+    expect(job.delivery?.failureDestination).toBeUndefined();
+    expect(job.failureAlert).toBeUndefined();
+  });
+});
 
 describe("createJob rejects sessionTarget main for non-default agents", () => {
   const now = Date.parse("2026-02-28T12:00:00.000Z");
@@ -510,7 +706,7 @@ describe("createJob rejects sessionTarget main for non-default agents", () => {
           },
         },
       }),
-    ).toThrow('cron channel delivery config is only supported for sessionTarget="isolated"');
+    ).toThrow(/cron channel delivery config is not allowed on main-session jobs/);
   });
 });
 

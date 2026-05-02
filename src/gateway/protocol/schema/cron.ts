@@ -155,31 +155,55 @@ export const CronPayloadPatchSchema = Type.Union([
   }),
 ]);
 
+// `channel` / `accountId` accept empty strings here for the same
+// agent-wrapper-tolerance reason as CronFailureDestinationSchema below.
+// Runtime emptiness is handled in src/cron/service/jobs.ts via
+// isEmptyFailureAlert / normalizeEmptyFailureAlertShape: an all-empty
+// failureAlert is normalized to `undefined` so wrapper-emitted defaults
+// like `{after:0, channel:"", to:"", cooldownMs:0, mode:"announce",
+// accountId:""}` don't trip the schema's NonEmptyString constraint or
+// surface as a meaningless alert config to downstream code.
+//
+// Note: `after` accepts `minimum: 0` here so wrapper-emitted
+// `after: 0` defaults pass schema validation; the runtime normalizer
+// (normalizeEmptyFailureAlertShape) treats `after <= 0` as empty and
+// strips it. mergeCronFailureAlert already coerces `after <= 0` to
+// undefined, so this preserves existing patch semantics.
 export const CronFailureAlertSchema = Type.Object(
   {
-    after: Type.Optional(Type.Integer({ minimum: 1 })),
-    channel: Type.Optional(Type.Union([Type.Literal("last"), NonEmptyString])),
+    after: Type.Optional(Type.Integer({ minimum: 0 })),
+    channel: Type.Optional(Type.Union([Type.Literal(""), Type.Literal("last"), NonEmptyString])),
     to: Type.Optional(Type.String()),
     cooldownMs: Type.Optional(Type.Integer({ minimum: 0 })),
     mode: Type.Optional(Type.Union([Type.Literal("announce"), Type.Literal("webhook")])),
-    accountId: Type.Optional(NonEmptyString),
+    accountId: Type.Optional(Type.String()),
   },
   { additionalProperties: false },
 );
 
+// `channel` / `accountId` accept empty strings here; the runtime layer
+// (assertFailureDestinationSupport + isEmptyFailureDestination) treats an
+// all-empty failureDestination as if the field were omitted entirely. This
+// is the schema half of the agent-wrapper-tolerance fix: agents whose tool
+// shims pad these fields with "" should not be rejected at the protocol
+// boundary just because the wrapper is sloppy.
 export const CronFailureDestinationSchema = Type.Object(
   {
-    channel: Type.Optional(Type.Union([Type.Literal("last"), NonEmptyString])),
+    channel: Type.Optional(Type.Union([Type.Literal(""), Type.Literal("last"), NonEmptyString])),
     to: Type.Optional(Type.String()),
-    accountId: Type.Optional(NonEmptyString),
+    accountId: Type.Optional(Type.String()),
     mode: Type.Optional(Type.Union([Type.Literal("announce"), Type.Literal("webhook")])),
   },
   { additionalProperties: false },
 );
 
+// Shared `channel` / `accountId` accept empty strings for the same
+// agent-wrapper-tolerance reason as CronFailureDestinationSchema above.
+// Runtime emptiness is handled in src/cron/service/jobs.ts via
+// isEffectivelyEmptyDelivery / assertDeliverySupport.
 const CronDeliverySharedProperties = {
-  channel: Type.Optional(Type.Union([Type.Literal("last"), NonEmptyString])),
-  accountId: Type.Optional(NonEmptyString),
+  channel: Type.Optional(Type.Union([Type.Literal(""), Type.Literal("last"), NonEmptyString])),
+  accountId: Type.Optional(Type.String()),
   bestEffort: Type.Optional(Type.Boolean()),
   failureDestination: Type.Optional(CronFailureDestinationSchema),
 };
